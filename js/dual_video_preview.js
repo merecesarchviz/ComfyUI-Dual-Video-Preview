@@ -1,7 +1,6 @@
 /**
  * DualVideoPreview – ComfyUI frontend
- * Frame tensors are now H.265 MP4s, so all layers are <video> elements.
- * Controls always visible; no GIF hacks needed.
+ * Based on the known-working version, with audio controls added minimally.
  */
 
 import { app } from "/scripts/app.js";
@@ -65,6 +64,7 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
   // Aspect ratio from first video that loads metadata
   const anyVideo = layerBottom || layerTop;
   if (anyVideo) {
+    stage.style.aspectRatio = "16 / 9"; // provisional so stage has height immediately
     anyVideo.addEventListener("loadedmetadata", () => {
       const w = anyVideo.videoWidth, h = anyVideo.videoHeight;
       if (w && h) stage.style.aspectRatio = `${w} / ${h}`;
@@ -98,14 +98,17 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
 
   // ── Drag ──────────────────────────────────────────────────────────────────
   let dragging = false;
+  let sliderPct = 0.5;
+
   function applySlider(clientX) {
     const rect = stage.getBoundingClientRect();
-    const pct = Math.max(0.02, Math.min(0.98, (clientX - rect.left) / rect.width));
-    const p = (pct * 100).toFixed(2) + "%";
+    sliderPct = Math.max(0.02, Math.min(0.98, (clientX - rect.left) / rect.width));
+    const p = (sliderPct * 100).toFixed(2) + "%";
     line.style.left = p;
     handle.style.left = p;
-    if (layerTop) layerTop.style.clipPath = `inset(0 ${((1 - pct) * 100).toFixed(2)}% 0 0)`;
+    if (layerTop) layerTop.style.clipPath = `inset(0 ${((1 - sliderPct) * 100).toFixed(2)}% 0 0)`;
   }
+
   stage.addEventListener("mousedown", e => {
     dragging = true;
     handle.style.transform = "translate(-50%, -50%) scale(1.18)";
@@ -141,12 +144,14 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
 
   // ── Controls bar ──────────────────────────────────────────────────────────
   const allVideos = [layerBottom, layerTop].filter(Boolean);
-  let playing = true, muted = true;
+  let playing = true;
+  let globalMuted = true;
 
   const bar = document.createElement("div");
   Object.assign(bar.style, {
     display: "flex", alignItems: "center", gap: "6px",
     padding: "6px 10px", background: "#111", borderTop: "1px solid #222",
+    boxSizing: "border-box", width: "100%",
   });
 
   function btn(icon, title) {
@@ -156,39 +161,64 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
       background: "#1e1e1e", color: "#ccc", border: "1px solid #2e2e2e",
       borderRadius: "5px", cursor: "pointer", fontSize: "14px",
       padding: "4px 10px", lineHeight: "1.5", transition: "background 0.1s",
+      flexShrink: "0",
     });
     b.onmouseenter = () => { b.style.background = "#2a2a2a"; };
     b.onmouseleave = () => { b.style.background = "#1e1e1e"; };
     return b;
   }
 
-  const ppBtn  = btn("⏸", "Play / Pause");
-  const rstBtn = btn("⟳",  "Restart");
-  const mutBtn = btn("🔇", "Toggle audio");
-
+  // Play / Pause — drives layerBottom as master; syncVideos handles layerTop
+  const ppBtn = btn("⏸", "Play / Pause");
   ppBtn.onclick = () => {
     playing = !playing;
     ppBtn.textContent = playing ? "⏸" : "▶";
-    allVideos.forEach(v => playing ? v.play().catch(()=>{}) : v.pause());
+    allVideos.forEach(v => playing ? v.play().catch(() => {}) : v.pause());
   };
 
+  // Restart
+  const rstBtn = btn("⟳", "Restart");
   rstBtn.onclick = () => {
     playing = true;
     ppBtn.textContent = "⏸";
-    allVideos.forEach(v => { v.currentTime = 0; v.play().catch(()=>{}); });
+    allVideos.forEach(v => { v.currentTime = 0; v.play().catch(() => {}); });
   };
 
+  // Mute / Unmute
+  // IMPORTANT: clicking this button IS the user gesture that browsers require
+  // before they allow audio to play. Setting muted=false anywhere else won't work.
+  const mutBtn = btn("🔇", "Toggle audio");
   mutBtn.onclick = () => {
-    muted = !muted;
-    allVideos.forEach(v => { v.muted = muted; });
-    mutBtn.textContent = muted ? "🔇" : "🔊";
+    globalMuted = !globalMuted;
+    mutBtn.textContent = globalMuted ? "🔇" : "🔊";
+    mutBtn.style.color  = globalMuted ? "#ccc" : "#4af";
+    // Apply muted directly here — inside a click handler = trusted user gesture
+    if (globalMuted) {
+      allVideos.forEach(v => { v.muted = true; });
+    } else {
+      // Only unmute the dominant side; the other stays muted
+      if (layerBottom) layerBottom.muted = sliderPct >= 0.5; // After  side
+      if (layerTop)    layerTop.muted    = sliderPct <  0.5; // Before side
+    }
+  };
+
+  // Volume slider
+  const volSlider = document.createElement("input");
+  volSlider.type = "range";
+  volSlider.min = "0"; volSlider.max = "1"; volSlider.step = "0.02"; volSlider.value = "1";
+  Object.assign(volSlider.style, {
+    width: "64px", accentColor: "#4af", cursor: "pointer", flexShrink: "0",
+  });
+  volSlider.oninput = () => {
+    const vol = parseFloat(volSlider.value);
+    allVideos.forEach(v => { v.volume = vol; });
   };
 
   // Timecode from the bottom (master) video
   const time = document.createElement("span");
   Object.assign(time.style, {
     marginLeft: "auto", fontSize: "9px", color: "#555",
-    fontVariantNumeric: "tabular-nums",
+    fontVariantNumeric: "tabular-nums", flexShrink: "0",
   });
   const fmt = s => isFinite(s)
     ? `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`
@@ -199,7 +229,7 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
     };
   }
 
-  bar.append(ppBtn, rstBtn, mutBtn, time);
+  bar.append(ppBtn, rstBtn, mutBtn, volSlider, time);
   root.appendChild(bar);
 
   // ── Hint ──────────────────────────────────────────────────────────────────
@@ -208,7 +238,7 @@ function buildSliderWidget(videoDataArray, loop, onSizeReady) {
     textAlign: "center", fontSize: "9px", color: "#444",
     padding: "3px", background: "#0d0d0d", letterSpacing: "0.08em",
   });
-  hint.textContent = "drag ⇔ to compare";
+  hint.textContent = "drag ⇔ to compare  •  click 🔇 to enable audio";
   root.appendChild(hint);
 
   return root;

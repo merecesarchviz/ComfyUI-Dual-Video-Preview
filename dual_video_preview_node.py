@@ -4,12 +4,14 @@ Fast MP4 encoding matching VHS performance:
 - Frames written to temp PNGs in parallel threads
 - Single ffmpeg call with image sequence input (much faster than pipe)
 - H.265 with fallback to H.264
+- Optional AUDIO inputs muxed as AAC into the MP4
 """
 
 import os
 import hashlib
 import subprocess
 import threading
+import wave
 import numpy as np
 from PIL import Image
 import folder_paths
@@ -33,13 +35,38 @@ HAS_H264 = "libx264" in _CODEC_LIST
 def _write_frame(args):
     """Write a single frame PNG to disk. Called from thread pool."""
     frame_np, path = args
-    img = Image.fromarray(frame_np)
-    img.save(path, format="PNG", compress_level=1)  # level 1 = fast, not smallest
+    Image.fromarray(frame_np).save(path, format="PNG", compress_level=1)
 
 
-def _frames_to_mp4(frames_tensor, fps: float, uid_extra: str = "") -> str:
+def _write_audio_wav(audio_dict: dict, path: str):
+    """
+    Write a ComfyUI AUDIO dict {"waveform": Tensor(1,C,N), "sample_rate": int}
+    to a 16-bit WAV file that ffmpeg can mux.
+    """
+    waveform    = audio_dict["waveform"]
+    sample_rate = int(audio_dict["sample_rate"])
+
+    wav = waveform.cpu().numpy()
+    if wav.ndim == 3:
+        wav = wav[0]           # (1,C,N) → (C,N)
+    if wav.ndim == 1:
+        wav = wav[np.newaxis]  # mono → (1,N)
+
+    channels, samples = wav.shape
+    wav_i16 = (np.clip(wav, -1.0, 1.0) * 32767).astype(np.int16)
+    interleaved = wav_i16.T.flatten().tobytes()
+
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(interleaved)
+
+
+def _frames_to_mp4(frames_tensor, fps: float, audio_dict=None, uid_extra: str = "") -> str:
     """
     Convert (B, H, W, C) float32 tensor → H.265/H.264 MP4.
+    Optionally muxes audio from a ComfyUI AUDIO dict.
     Uses parallel PNG writes + ffmpeg image-sequence input for maximum speed.
     Returns filename relative to output_dir.
     """
@@ -49,8 +76,14 @@ def _frames_to_mp4(frames_tensor, fps: float, uid_extra: str = "") -> str:
     frames = frames_tensor.cpu().numpy()
     B, H, W, C = frames.shape
 
-    # Unique output filename
-    uid = hashlib.md5((str(frames.shape) + str(fps) + uid_extra).encode()).hexdigest()[:12]
+    # Cache key: hash actual pixel content (first + mid + last frame) so that
+    # new frames with the same shape/fps always produce a different filename.
+    audio_sig = str(audio_dict["waveform"].shape) if audio_dict else "noaudio"
+    hasher = hashlib.md5()
+    for fi in [0, B // 2, B - 1]:
+        hasher.update((np.clip(frames[fi], 0.0, 1.0) * 255).astype(np.uint8).tobytes())
+    hasher.update((str(fps) + uid_extra + audio_sig).encode())
+    uid = hasher.hexdigest()[:12]
     filename = f"dvp_{uid}.mp4"
     filepath = os.path.join(output_dir, filename)
 
@@ -72,13 +105,23 @@ def _frames_to_mp4(frames_tensor, fps: float, uid_extra: str = "") -> str:
         with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
             list(pool.map(_write_frame, zip(frames_u8, paths)))
 
+        # --- Write audio WAV if provided --------------------------------------
+        audio_path = None
+        if audio_dict is not None:
+            try:
+                audio_path = os.path.join(tmpdir, "audio.wav")
+                _write_audio_wav(audio_dict, audio_path)
+            except Exception as e:
+                print(f"[DualVideoPreview] Audio write failed, encoding without audio: {e}")
+                audio_path = None
+
         # --- Pick encoder -----------------------------------------------------
         if HAS_H265:
             vcodec = "libx265"
             codec_args = [
-                "-tag:v", "hvc1",   # Safari/QuickTime compat
+                "-tag:v", "hvc1",
                 "-crf", "20",
-                "-preset", "ultrafast",  # fastest encode, still good quality
+                "-preset", "ultrafast",
                 "-x265-params", "log-level=error",
             ]
         elif HAS_H264:
@@ -88,18 +131,36 @@ def _frames_to_mp4(frames_tensor, fps: float, uid_extra: str = "") -> str:
         else:
             raise RuntimeError("[DualVideoPreview] No supported video encoder found (need libx265 or libx264)")
 
-        # --- Single ffmpeg call with glob input -------------------------------
+        # --- Build ffmpeg command ---------------------------------------------
         cmd = [
             "ffmpeg", "-y",
             "-r", str(fps),
             "-i", os.path.join(tmpdir, "f%06d.png"),
+        ]
+
+        if audio_path:
+            cmd += ["-i", audio_path]
+
+        cmd += [
             "-vcodec", vcodec,
             *codec_args,
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            "-an",           # no audio
-            filepath,
         ]
+
+        if audio_path:
+            video_duration = B / fps
+            cmd += [
+                "-acodec", "aac",
+                "-b:a", "192k",
+                "-t", str(video_duration),
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+            ]
+        else:
+            cmd += ["-an"]
+
+        cmd.append(filepath)
 
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
@@ -120,6 +181,8 @@ class DualVideoPreview:
                 "video_2":  ("STRING", {"default": "", "tooltip": "Path to second video file"}),
                 "frames_1": ("IMAGE",  {"tooltip": "Frame sequence for video 1 (B,H,W,C)"}),
                 "frames_2": ("IMAGE",  {"tooltip": "Frame sequence for video 2 (B,H,W,C)"}),
+                "audio_1":  ("AUDIO",  {"tooltip": "Audio track for video 1"}),
+                "audio_2":  ("AUDIO",  {"tooltip": "Audio track for video 2"}),
                 "label_1":  ("STRING", {"default": "Before"}),
                 "label_2":  ("STRING", {"default": "After"}),
                 "fps":      ("FLOAT",  {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.5}),
@@ -131,12 +194,12 @@ class DualVideoPreview:
     FUNCTION = "preview_videos"
     OUTPUT_NODE = True
     CATEGORY = "image/video"
-    DESCRIPTION = "Preview two videos with a drag-to-compare slider. Encodes frames as H.265 MP4 using parallel PNG writes for speed."
+    DESCRIPTION = "Preview two videos with a drag-to-compare slider. Encodes frames as H.265 MP4 with optional audio."
 
-    def _resolve(self, path, frames, label, slot, fps):
+    def _resolve(self, path, frames, audio, label, slot, fps):
         if frames is not None:
             try:
-                filename = _frames_to_mp4(frames, fps, label + str(slot))
+                filename = _frames_to_mp4(frames, fps, audio_dict=audio, uid_extra=label + str(slot))
             except RuntimeError as e:
                 print(e)
                 return None
@@ -157,15 +220,15 @@ class DualVideoPreview:
         return None
 
     def preview_videos(self, video_1="", video_2="", frames_1=None, frames_2=None,
+                       audio_1=None, audio_2=None,
                        label_1="Before", label_2="After", fps=24.0, loop=True):
         results = []
-        # Encode both videos in parallel threads
         v1_result, v2_result = [None], [None]
 
         def enc1():
-            v1_result[0] = self._resolve(video_1, frames_1, label_1, 1, fps)
+            v1_result[0] = self._resolve(video_1, frames_1, audio_1, label_1, 1, fps)
         def enc2():
-            v2_result[0] = self._resolve(video_2, frames_2, label_2, 2, fps)
+            v2_result[0] = self._resolve(video_2, frames_2, audio_2, label_2, 2, fps)
 
         t1 = threading.Thread(target=enc1)
         t2 = threading.Thread(target=enc2)
@@ -177,5 +240,5 @@ class DualVideoPreview:
         return {"ui": {"dual_videos": results, "loop": [loop]}}
 
 
-NODE_CLASS_MAPPINGS       = {"DualVideoPreview": DualVideoPreview}
+NODE_CLASS_MAPPINGS        = {"DualVideoPreview": DualVideoPreview}
 NODE_DISPLAY_NAME_MAPPINGS = {"DualVideoPreview": "Dual Video Preview 🎬"}
