@@ -9,4 +9,4 @@ Documentation is mostly in the node descriptions and tooltips.
 1. Clone this repo into `custom_nodes` folder.
 2. Restart ComfyUI
 
-https://github.com/merecesarchviz/ComfyUI-Dual-Video-Preview/blob/main/preview/dualvideopreview.jpeg
+<img src="preview/dualvideopreview.jpeg"/> 
